@@ -9,6 +9,7 @@ use crate::{
     llm::{InputMessage, Role, schema},
     memory::{CoreFact, Memory, Message, Speaker},
     persona::{self, Persona, PersonaMeta},
+    relationship::{self, DimensionUpdate},
     timefmt,
 };
 
@@ -26,6 +27,8 @@ pub struct TurnContext<'a> {
     pub emotions: &'a Emotions,
     /// What the companion knows about the model it runs on.
     pub mind: String,
+    /// How the companion sees the relationship.
+    pub relationship: String,
     pub messages: &'a [Message],
     pub now: DateTime<Utc>,
 }
@@ -35,6 +38,8 @@ pub struct TurnOutput {
     pub inner_thoughts: String,
     pub reply: String,
     pub emotions: Emotions,
+    #[serde(default)]
+    pub relationship_changes: Vec<DimensionUpdate>,
 }
 
 pub fn turn_schema() -> Value {
@@ -48,6 +53,7 @@ pub fn turn_schema() -> Value {
             "emotions",
             Emotions::schema("1 to 4 emotions you feel right now, strongest first"),
         ),
+        ("relationship_changes", relationship::updates_schema()),
     ])
 }
 
@@ -107,6 +113,9 @@ life. Keep messages chat-sized unless the moment calls for more, and follow your
 # Your mind
 {mind}
 
+# Your relationship with {user}
+{relationship}
+
 # Things you know for sure
 {facts}
 
@@ -125,7 +134,11 @@ has been and react like a person would. Answer with JSON:
 - inner_thoughts: what you privately think and feel before replying, and what you want.
 - reply: the message you send to {user} — plain chat text, without timestamps or your name.
 - emotions: what you feel after this exchange (intensity 0-100). Feelings carry over and \
-change gradually, unless something strong happens.",
+change gradually, unless something strong happens.
+- relationship_changes: relationship dimensions that changed because of this exchange, with \
+their new value. Usually none or small steps (1-5); bigger only when something important \
+happens.",
+        relationship = ctx.relationship,
         persona = persona::render_for_prompt(ctx.persona, ctx.persona_meta),
         time = timefmt::stamp(now),
         met = timefmt::ago(ctx.met_at, now),
@@ -211,6 +224,7 @@ mod tests {
             recalled: vec![&m],
             emotions: &feel,
             mind: "- Your mind runs on the AI model test-model".into(),
+            relationship: "- What it is: \"new friends\"".into(),
             messages: &[],
             now,
         };
@@ -223,5 +237,6 @@ mod tests {
         assert!(text.contains("You met Borys 10 days ago"));
         assert!(text.contains("How you feel at this moment: curiosity 40"));
         assert!(text.contains("# Your mind\n- Your mind runs on the AI model test-model"));
+        assert!(text.contains("# Your relationship with Borys\n- What it is: \"new friends\""));
     }
 }

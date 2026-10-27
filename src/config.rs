@@ -44,6 +44,8 @@ pub struct Config {
     pub recent_memories_in_prompt: usize,
 
     pub emotion_half_life_hours: f64,
+    /// How much a relationship dimension may change in a single message.
+    pub relationship_max_step: u8,
     /// After this much silence the companion speaks first when the user comes back.
     pub absence_greeting_after_minutes: i64,
     /// How many of the last messages are shown when resuming a conversation (0 = none).
@@ -89,6 +91,7 @@ impl Default for Config {
             recall_min_similarity: 0.25,
             recent_memories_in_prompt: 3,
             emotion_half_life_hours: 12.0,
+            relationship_max_step: 15,
             absence_greeting_after_minutes: 60,
             resume_history_messages: 10,
         }
