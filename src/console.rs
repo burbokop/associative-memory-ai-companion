@@ -14,6 +14,7 @@ use crate::{
     memory::{Message, Speaker},
     persona::{self, Author, PersonaMeta},
     profile::{Paths, Profile, State},
+    relationship,
     session::{Reply, Session},
     storage, timefmt,
 };
@@ -21,10 +22,12 @@ use crate::{
 const HELP: &str = "\
 /emotions          how your companion feels right now
 /persona           show the persona and who wrote each field
+/relationship      how your companion sees your relationship (they will know you looked;
+                   with /debug on you also see their private opinion and wishes)
 /memories [query]  list long-term memories (strongest first), or search them
 /facts             core facts that are never forgotten
 /compact           consolidate the conversation into long-term memory now
-/debug             toggle showing inner thoughts and recalled memories
+/debug             toggle showing inner thoughts, recalled memories, relationship changes
 /help              this help
 /exit              leave (also Ctrl-D); everything is saved after each message";
 
@@ -144,7 +147,27 @@ fn print_reply(name: &str, reply: &Reply, debug: bool) {
         print_thoughts(&reply.thoughts);
     }
     println!("{}  {}", name.bold().magenta(), reply.emotions.render());
-    println!("{}\n", reply.content);
+    println!("{}", reply.content);
+    if debug && !reply.relationship_changes.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "  💞 {}",
+                relationship::render_changes(&reply.relationship_changes)
+            )
+            .dimmed()
+        );
+    }
+    println!();
+}
+
+fn print_new_label(name: &str, label: &Option<String>) {
+    if let Some(label) = label {
+        println!(
+            "{}",
+            format!("💞 {name} now sees your relationship as: {label}").italic()
+        );
+    }
 }
 
 /// Shows the end of the previous conversation when resuming.
@@ -194,10 +217,14 @@ pub async fn chat<L: Llm>(
     println!(
         "{}",
         format!(
-            "Chatting with {name} (profile '{}', model {}). Type /help for commands.\n",
+            "Chatting with {name} (profile '{}', model {}). Type /help for commands.",
             session.profile.name, session.config.model
         )
         .dimmed()
+    );
+    println!(
+        "{}\n",
+        relationship::render_summary(&session.profile.relationship)
     );
 
     print_history(
@@ -284,11 +311,37 @@ pub async fn chat<L: Llm>(
                         Err(e) => print_error(&e),
                     }
                 }
+                "relationship" => {
+                    println!(
+                        "{}",
+                        relationship::render_full(
+                            &session.profile.relationship,
+                            &session.profile.relationship_meta,
+                            debug,
+                        )
+                    );
+                    println!(
+                        "{}",
+                        session
+                            .profile
+                            .paths
+                            .relationship()
+                            .display()
+                            .to_string()
+                            .dimmed()
+                    );
+                    if let Err(e) = session.relationship_viewed(debug) {
+                        print_error(&e);
+                    }
+                }
                 "compact" => match session.maintain_memory(true).await {
-                    Ok(r) => println!(
-                        "{} messages → {} new memories; {} faded memories merged",
-                        r.consolidated_messages, r.new_memories, r.faded_memories
-                    ),
+                    Ok(r) => {
+                        println!(
+                            "{} messages → {} new memories; {} faded memories merged",
+                            r.consolidated_messages, r.new_memories, r.faded_memories
+                        );
+                        print_new_label(&name, &r.new_relationship_label);
+                    }
                     Err(e) => print_error(&e),
                 },
                 _ => println!("unknown command; try /help"),
@@ -308,15 +361,19 @@ pub async fn chat<L: Llm>(
         }
 
         match session.maintain_memory(false).await {
-            Ok(r) if debug && r.consolidated_messages > 0 => println!(
-                "{}",
-                format!(
-                    "  🧠 consolidated {} messages into {} memories, merged {} faded ones",
-                    r.consolidated_messages, r.new_memories, r.faded_memories
-                )
-                .dimmed()
-            ),
-            Ok(_) => {}
+            Ok(r) => {
+                if debug && r.consolidated_messages > 0 {
+                    println!(
+                        "{}",
+                        format!(
+                            "  🧠 consolidated {} messages into {} memories, merged {} faded ones",
+                            r.consolidated_messages, r.new_memories, r.faded_memories
+                        )
+                        .dimmed()
+                    );
+                }
+                print_new_label(&name, &r.new_relationship_label);
+            }
             // Short-term memory is kept, so this is retried after the next message.
             Err(e) => print_error(&e.context("memory consolidation failed")),
         }

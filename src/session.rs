@@ -1,6 +1,6 @@
 //! Conversation logic, independent of the console.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{TimeDelta, Utc};
 
 use crate::{
@@ -10,10 +10,12 @@ use crate::{
     llm::{JsonRequest, Llm},
     memory::{self, Memory, Message, Speaker},
     mind::{self, Mind, MindRecord},
-    persona,
+    persona::{self, Persona},
     profile::Profile,
     prompt::{self, TurnContext, TurnOutput},
-    timefmt,
+    relationship::{self, DimensionChange, Relationship},
+    storage, timefmt,
+    tracking::Author,
 };
 
 /// How many recent messages are used to trigger associative recall.
@@ -24,6 +26,7 @@ pub struct Reply {
     pub emotions: Emotions,
     pub thoughts: String,
     pub recalled: Vec<String>,
+    pub relationship_changes: Vec<DimensionChange>,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +35,8 @@ pub struct MaintenanceReport {
     pub new_memories: usize,
     pub faded_memories: usize,
     pub core_facts_condensed: bool,
+    /// The companion now describes the relationship differently.
+    pub new_relationship_label: Option<String>,
 }
 
 pub struct Session<L: Llm> {
@@ -57,28 +62,59 @@ impl<L: Llm> Session<L> {
         &self.profile.state.user_name
     }
 
-    /// Notices what happened since the last session (time passed, persona edits)
-    /// and lets the companion speak first if there is a reason to.
+    /// Re-reads the user-editable files (persona, relationship) and tells the
+    /// companion about edits. Returns whether anything was edited.
+    fn sync_files(&mut self) -> Result<bool> {
+        let now = Utc::now();
+        let user = self.user_name().to_string();
+        let profile = &mut self.profile;
+        let mut edited = false;
+
+        let persona_path = profile.paths.persona();
+        let persona: Persona = storage::load(&persona_path)?
+            .with_context(|| format!("{} is missing", persona_path.display()))?;
+        let changes = profile
+            .persona_meta
+            .tracked
+            .record(&persona, Author::User, now);
+        if !changes.is_empty() {
+            profile.persona = persona;
+            profile.save_persona_meta()?;
+            let text = persona::describe_changes(&changes, &user);
+            profile
+                .short_term
+                .push(Message::new(Speaker::Event, text, now));
+            edited = true;
+        }
+
+        match storage::load::<Relationship>(&profile.paths.relationship())? {
+            // Deleted while running: put the current state back.
+            None => profile.save_relationship()?,
+            Some(relationship) => {
+                let changes = profile
+                    .relationship_meta
+                    .record(&relationship, Author::User, now);
+                if !changes.is_empty() {
+                    profile.relationship = relationship;
+                    profile.save_relationship_meta()?;
+                    let text = relationship::describe_changes(&changes, &user);
+                    profile
+                        .short_term
+                        .push(Message::new(Speaker::Event, text, now));
+                    edited = true;
+                }
+            }
+        }
+        Ok(edited)
+    }
+
+    /// Notices what happened since the last session (time passed, edits of persona
+    /// or relationship, model change) and lets the companion speak first if there is
+    /// a reason to.
     pub async fn start(&mut self) -> Result<Option<Reply>> {
         let now = Utc::now();
         let user = self.user_name().to_string();
-        let mut speak_first = false;
-
-        let changes = persona::detect_changes(&self.profile.persona, &self.profile.persona_meta);
-        if !changes.is_empty() {
-            persona::accept_user_changes(
-                &mut self.profile.persona_meta,
-                &self.profile.persona,
-                &changes,
-                now,
-            );
-            self.profile.save_persona_meta()?;
-            let text = persona::describe_changes(&changes, &user);
-            self.profile
-                .short_term
-                .push(Message::new(Speaker::Event, text, now));
-            speak_first = true;
-        }
+        let mut speak_first = self.sync_files()?;
 
         let current_mind = Mind::from_config(&self.config);
         match &self.profile.state.mind {
@@ -147,6 +183,8 @@ impl<L: Llm> Session<L> {
     }
 
     pub async fn user_says(&mut self, text: &str) -> Result<Reply> {
+        // Files may have been edited while the chat is open.
+        self.sync_files()?;
         let now = Utc::now();
         let previous_interaction = self.profile.state.last_interaction;
         self.profile
@@ -209,6 +247,12 @@ impl<L: Llm> Session<L> {
                 &profile.state.user_name,
                 now,
             ),
+            relationship: relationship::render_for_prompt(
+                &profile.relationship,
+                &profile.relationship_meta,
+                &profile.state.user_name,
+                now,
+            ),
             messages: &profile.short_term,
             now,
         };
@@ -231,11 +275,23 @@ impl<L: Llm> Session<L> {
         profile.state.last_interaction = Some(now);
         profile.save()?;
 
+        let relationship_changes = relationship::apply_updates(
+            &mut profile.relationship,
+            &mut profile.relationship_meta,
+            &output.relationship_changes,
+            config.relationship_max_step,
+            now,
+        );
+        if !relationship_changes.is_empty() {
+            profile.save_relationship()?;
+        }
+
         Ok(Reply {
             content: output.reply,
             emotions: output.emotions,
             thoughts: output.inner_thoughts,
             recalled: recalled_text,
+            relationship_changes,
         })
     }
 
@@ -275,6 +331,20 @@ impl<L: Llm> Session<L> {
         .await?;
         report.new_memories = profile.long_term.memories.len() - before;
         report.consolidated_messages = count;
+
+        let transcript =
+            memory::transcript(&profile.short_term[..count], names.companion, names.user);
+        report.new_relationship_label = relationship::reflect(
+            &self.llm,
+            &mut profile.relationship,
+            &mut profile.relationship_meta,
+            &transcript,
+            &names,
+            now,
+        )
+        .await?;
+        profile.save_relationship()?;
+
         profile.short_term.drain(..count);
         profile.save()?;
 
@@ -296,6 +366,15 @@ impl<L: Llm> Session<L> {
         .await?;
         profile.save()?;
         Ok(report)
+    }
+
+    /// Lets the companion know the user looked at the relationship view.
+    pub fn relationship_viewed(&mut self, saw_private: bool) -> Result<()> {
+        let text = relationship::viewed_event(self.user_name(), saw_private);
+        self.profile
+            .short_term
+            .push(Message::new(Speaker::Event, text, Utc::now()));
+        self.profile.save()
     }
 
     /// The last `count` chat messages (without internal events), oldest first.
@@ -353,7 +432,8 @@ mod tests {
         json!({
             "inner_thoughts": "thinking",
             "reply": reply,
-            "emotions": [{"name": "joy", "intensity": 50}]
+            "emotions": [{"name": "joy", "intensity": 50}],
+            "relationship_changes": []
         })
     }
 
@@ -479,11 +559,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relationship_changes_with_each_message() {
+        let mut answer = turn("You remembered! That means a lot.");
+        answer["relationship_changes"] = json!([
+            {"dimension": "trust", "value": 28},
+            {"dimension": "closeness", "value": 90}
+        ]);
+        let (mut s, data) = session("rel-turn", vec![answer]);
+        s.profile.state.last_interaction = Some(Utc::now());
+        let reply = s.user_says("Happy birthday, Mira!").await.unwrap();
+
+        let changes = relationship::render_changes(&reply.relationship_changes);
+        assert_eq!(
+            changes, "trust 20→28 ↑ · closeness 5→20 ↑",
+            "big jumps are limited"
+        );
+        let on_disk: Relationship = storage::load(&s.profile.paths.relationship())
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk.dimensions["trust"], json!(28));
+        let instructions = &s.llm.requests.borrow()[0].instructions;
+        assert!(instructions.contains("# Your relationship with Borys"));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn notices_relationship_edits_while_chatting() {
+        let (mut s, data) = session(
+            "rel-edit",
+            vec![turn("Wait, did you just change how I feel?")],
+        );
+        s.profile.state.last_interaction = Some(Utc::now());
+        let mut edited = s.profile.relationship.clone();
+        edited.dimensions.insert("attraction".into(), json!(90));
+        storage::save(&s.profile.paths.relationship(), &edited).unwrap();
+
+        s.user_says("hi").await.unwrap();
+        let event = last_event(&s);
+        assert!(event.contains("edited the file that describes your relationship"));
+        assert!(event.contains("\"dimensions.attraction\" from \"5\" (chosen by you) to \"90\""));
+        // The event comes before the user's message, so the reply can react to it.
+        let speakers: Vec<Speaker> = s.profile.short_term.iter().map(|m| m.speaker).collect();
+        assert_eq!(
+            speakers,
+            [Speaker::Event, Speaker::User, Speaker::Companion]
+        );
+        assert_eq!(s.profile.relationship.dimensions["attraction"], json!(90));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn knows_when_the_user_looked_at_the_relationship() {
+        let (mut s, data) = session("rel-view", vec![]);
+        s.relationship_viewed(false).unwrap();
+        assert!(last_event(&s).contains("not at your private opinion"));
+        s.relationship_viewed(true).unwrap();
+        assert!(last_event(&s).contains("also your private opinion"));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
     async fn reacts_to_persona_edits() {
         let (mut s, data) = session("persona", vec![turn("Why did you make me fiery?")]);
         s.profile.state.last_interaction = Some(Utc::now() - TimeDelta::minutes(1));
-        s.profile.persona["personality"] = json!("fiery");
+        let mut persona = s.profile.persona.clone();
+        persona["personality"] = json!("fiery");
+        storage::save(&s.profile.paths.persona(), &persona).unwrap();
         assert!(s.start().await.unwrap().is_some());
+        assert_eq!(s.profile.persona["personality"], json!("fiery"));
         assert!(last_event(&s).contains("from \"calm\" (chosen by you) to \"fiery\""));
         assert_eq!(
             s.profile.persona_meta.author_of("personality"),
@@ -513,7 +656,12 @@ mod tests {
         });
         let (mut s, data) = session(
             "flow",
-            vec![turn("Oh no!"), consolidation, turn("Is Rex okay?")],
+            vec![
+                turn("Oh no!"),
+                consolidation,
+                json!({"label": "new friends", "opinion": "Funny guy.", "wishes": "More dog stories."}),
+                turn("Is Rex okay?"),
+            ],
         );
         s.profile.state.last_interaction = Some(Utc::now());
         s.user_says("My dog Rex ate my shoes").await.unwrap();
@@ -529,6 +677,12 @@ mod tests {
         let report = s.maintain_memory(true).await.unwrap();
         assert_eq!(report.consolidated_messages, 1);
         assert_eq!(report.new_memories, 1);
+        assert_eq!(
+            report.new_relationship_label.as_deref(),
+            Some("new friends")
+        );
+        assert_eq!(s.profile.relationship.opinion, "Funny guy.");
+        assert_eq!(s.profile.relationship_meta.history.len(), 2);
 
         let reply = s.user_says("Rex is sick today").await.unwrap();
         assert_eq!(reply.content, "Is Rex okay?");

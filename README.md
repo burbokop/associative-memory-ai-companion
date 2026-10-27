@@ -15,7 +15,7 @@ cargo run --release -- --help
 
 On first start of a profile the companion chooses its own persona (or you write it yourself).
 Inside the chat type `/help` for commands (`/emotions`, `/persona`, `/memories [query]`,
-`/facts`, `/compact`, `/debug`, `/exit`).
+`/facts`, `/relationship`, `/compact`, `/debug`, `/exit`).
 
 ## Data
 
@@ -28,6 +28,8 @@ config.json                   model, model catalog the companion knows about,
 profiles/<name>/
   persona.json                who the companion is — edit freely, they will notice
   persona_meta.json           who wrote each persona field + last seen snapshot
+  relationship.json           how the companion sees your relationship — editable too
+  relationship_meta.json      who wrote each field, snapshot, history of labels
   state.json                  user name, current emotions, last interaction time,
                               the model it ran on last (to notice upgrades/downgrades)
   short_term.json             recent raw messages (with emotions and inner thoughts)

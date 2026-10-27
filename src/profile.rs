@@ -15,7 +15,9 @@ use crate::{
     memory::{LongTerm, Message},
     mind::MindRecord,
     persona::{Persona, PersonaMeta},
+    relationship::{Relationship, RelationshipMeta},
     storage,
+    tracking::Author,
 };
 
 pub struct Paths {
@@ -29,12 +31,19 @@ impl Paths {
         }
     }
 
-    /// The only file meant to be edited by hand.
+    /// Meant to be edited by hand; the companion notices edits.
     pub fn persona(&self) -> PathBuf {
         self.dir.join("persona.json")
     }
     pub fn persona_meta(&self) -> PathBuf {
         self.dir.join("persona_meta.json")
+    }
+    /// Meant to be edited by hand too; the companion also updates it itself.
+    pub fn relationship(&self) -> PathBuf {
+        self.dir.join("relationship.json")
+    }
+    pub fn relationship_meta(&self) -> PathBuf {
+        self.dir.join("relationship_meta.json")
     }
     pub fn state(&self) -> PathBuf {
         self.dir.join("state.json")
@@ -74,6 +83,8 @@ pub struct Profile {
     pub paths: Paths,
     pub persona: Persona,
     pub persona_meta: PersonaMeta,
+    pub relationship: Relationship,
+    pub relationship_meta: RelationshipMeta,
     pub state: State,
     pub short_term: Vec<Message>,
     pub long_term: LongTerm,
@@ -93,11 +104,15 @@ impl Profile {
         state: State,
         embedding_model: &str,
     ) -> Result<Self> {
+        let relationship = Relationship::default();
+        let relationship_meta = RelationshipMeta::new(&relationship, Author::Companion, Utc::now());
         let profile = Self {
             name: name.to_string(),
             paths,
             persona,
             persona_meta,
+            relationship,
+            relationship_meta,
             state,
             short_term: Vec::new(),
             long_term: LongTerm::default(),
@@ -105,6 +120,7 @@ impl Profile {
         };
         storage::save(&profile.paths.persona(), &profile.persona)?;
         profile.save_persona_meta()?;
+        profile.save_relationship()?;
         profile.save()?;
         Ok(profile)
     }
@@ -122,6 +138,24 @@ impl Profile {
             storage::load(&required(paths.persona_meta())?)?.context("persona metadata missing")?;
         let state = storage::load(&required(paths.state())?)?.context("state missing")?;
         let short_term = storage::load(&paths.short_term())?.unwrap_or_default();
+
+        // A relationship file without metadata was written by the user; without the file
+        // (older profile, or deleted to reset) the relationship starts from scratch.
+        let relationship_file = storage::load(&paths.relationship())?;
+        let relationship_meta = storage::load(&paths.relationship_meta())?;
+        let relationship_missing = relationship_file.is_none() || relationship_meta.is_none();
+        let (relationship, relationship_meta) = match (relationship_file, relationship_meta) {
+            (Some(r), Some(m)) => (r, m),
+            (Some(r), None) => {
+                let meta = RelationshipMeta::new(&r, Author::User, Utc::now());
+                (r, meta)
+            }
+            (None, _) => {
+                let r = Relationship::default();
+                let meta = RelationshipMeta::new(&r, Author::Companion, Utc::now());
+                (r, meta)
+            }
+        };
         let mut long_term: LongTerm = storage::load(&paths.long_term())?.unwrap_or_default();
 
         // Vectors from another embedding model are not comparable: drop them,
@@ -132,16 +166,33 @@ impl Profile {
             long_term.embeddings = store.vectors;
         }
 
-        Ok(Self {
+        let profile = Self {
             name: name.to_string(),
             paths,
             persona,
             persona_meta,
+            relationship,
+            relationship_meta,
             state,
             short_term,
             long_term,
             embedding_model: embedding_model.to_string(),
-        })
+        };
+        if relationship_missing {
+            profile.save_relationship()?;
+        }
+        Ok(profile)
+    }
+
+    /// Writes the relationship file (only when the companion changed it, so that
+    /// edits by the user are not overwritten unseen) and its metadata.
+    pub fn save_relationship(&self) -> Result<()> {
+        storage::save(&self.paths.relationship(), &self.relationship)?;
+        self.save_relationship_meta()
+    }
+
+    pub fn save_relationship_meta(&self) -> Result<()> {
+        storage::save(&self.paths.relationship_meta(), &self.relationship_meta)
     }
 
     pub fn save_persona_meta(&self) -> Result<()> {

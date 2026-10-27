@@ -1,14 +1,17 @@
 //! The companion's persona: a user-editable JSON object of free-form fields,
 //! plus metadata remembering who wrote each field and what it looked like last time.
 
-use std::collections::BTreeMap;
-
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::llm::{InputMessage, JsonRequest, Llm, Role, schema};
+use crate::{
+    llm::{InputMessage, JsonRequest, Llm, Role, schema},
+    tracking::{self, Change, Tracked, show},
+};
+
+pub use crate::tracking::Author;
 
 pub type Persona = Map<String, Value>;
 
@@ -36,36 +39,13 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("quirks", "Small habits or oddities that make you you"),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Author {
-    Companion,
-    User,
-}
-
-impl Author {
-    fn describe(self) -> &'static str {
-        match self {
-            Author::Companion => "chosen by you",
-            Author::User => "set by the user",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FieldMeta {
-    pub author: Author,
-    pub updated_at: DateTime<Utc>,
-}
-
 /// Stored next to the persona in `persona_meta.json`; not meant for editing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaMeta {
     pub created_by: Author,
     pub created_at: DateTime<Utc>,
-    pub fields: BTreeMap<String, FieldMeta>,
-    /// The persona as it was when last seen, to detect edits.
-    pub snapshot: Persona,
+    #[serde(flatten)]
+    pub tracked: Tracked,
 }
 
 impl PersonaMeta {
@@ -73,142 +53,23 @@ impl PersonaMeta {
         Self {
             created_by: author,
             created_at: now,
-            fields: persona
-                .keys()
-                .map(|k| {
-                    (
-                        k.clone(),
-                        FieldMeta {
-                            author,
-                            updated_at: now,
-                        },
-                    )
-                })
-                .collect(),
-            snapshot: persona.clone(),
+            tracked: Tracked::new(persona, author, now),
         }
     }
 
     pub fn author_of(&self, field: &str) -> Author {
-        self.fields.get(field).map_or(Author::User, |m| m.author)
+        self.tracked.author_of(field)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Change {
-    Added {
-        field: String,
-        value: Value,
-    },
-    Removed {
-        field: String,
-        old: Value,
-        author: Author,
-    },
-    Modified {
-        field: String,
-        old: Value,
-        new: Value,
-        author: Author,
-    },
-}
-
-/// Compares the persona file with the last snapshot.
-pub fn detect_changes(current: &Persona, meta: &PersonaMeta) -> Vec<Change> {
-    let mut changes = Vec::new();
-    for (field, value) in current {
-        match meta.snapshot.get(field) {
-            None => changes.push(Change::Added {
-                field: field.clone(),
-                value: value.clone(),
-            }),
-            Some(old) if old != value => changes.push(Change::Modified {
-                field: field.clone(),
-                old: old.clone(),
-                new: value.clone(),
-                author: meta.author_of(field),
-            }),
-            Some(_) => {}
-        }
-    }
-    for (field, old) in &meta.snapshot {
-        if !current.contains_key(field) {
-            changes.push(Change::Removed {
-                field: field.clone(),
-                old: old.clone(),
-                author: meta.author_of(field),
-            });
-        }
-    }
-    changes
-}
-
-/// Records that the user made these changes and takes a new snapshot.
-pub fn accept_user_changes(
-    meta: &mut PersonaMeta,
-    current: &Persona,
-    changes: &[Change],
-    now: DateTime<Utc>,
-) {
-    for change in changes {
-        match change {
-            Change::Added { field, .. } | Change::Modified { field, .. } => {
-                meta.fields.insert(
-                    field.clone(),
-                    FieldMeta {
-                        author: Author::User,
-                        updated_at: now,
-                    },
-                );
-            }
-            Change::Removed { field, .. } => {
-                meta.fields.remove(field);
-            }
-        }
-    }
-    meta.snapshot = current.clone();
-}
-
-fn show(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// Explains the edits to the companion, in second person.
+/// Explains the user's edits to the companion, in second person.
 pub fn describe_changes(changes: &[Change], user_name: &str) -> String {
-    let mut text = format!(
-        "While you were apart, {user_name} edited the file that defines who you are. \
-         Notice it and react however feels natural to you — you may like it, dislike it, \
-         or ask why, especially if it overrides something you chose yourself:\n"
-    );
-    for change in changes {
-        let line = match change {
-            Change::Added { field, value } => format!("- added \"{field}\": {}", show(value)),
-            Change::Removed { field, old, author } => {
-                format!(
-                    "- removed \"{field}\" (was: {}; {})",
-                    show(old),
-                    author.describe()
-                )
-            }
-            Change::Modified {
-                field,
-                old,
-                new,
-                author,
-            } => format!(
-                "- changed \"{field}\" from \"{}\" ({}) to \"{}\"",
-                show(old),
-                author.describe(),
-                show(new)
-            ),
-        };
-        text.push_str(&line);
-        text.push('\n');
-    }
-    text
+    format!(
+        "{user_name} edited the file that defines who you are. Notice it and react however \
+         feels natural to you — you may like it, dislike it, or ask why, especially if it \
+         overrides something you chose yourself:\n{}",
+        tracking::describe_changes(changes)
+    )
 }
 
 /// The persona for the system prompt, with authorship of every field.
@@ -286,33 +147,19 @@ mod tests {
     }
 
     #[test]
-    fn detects_and_attributes_changes() {
+    fn describes_user_edits() {
         let now = Utc::now();
-        let original = persona(json!({"name": "Mira", "personality": "calm", "quirks": "hums"}));
+        let original = persona(json!({"name": "Mira", "personality": "calm"}));
         let mut meta = PersonaMeta::new(&original, Author::Companion, now);
-
-        let edited = persona(json!({"name": "Mira", "personality": "fiery", "hobby": "chess"}));
-        let changes = detect_changes(&edited, &meta);
-        assert_eq!(changes.len(), 3);
-        assert!(changes.contains(&Change::Modified {
-            field: "personality".into(),
-            old: json!("calm"),
-            new: json!("fiery"),
-            author: Author::Companion,
-        }));
-        assert!(changes.contains(&Change::Added {
-            field: "hobby".into(),
-            value: json!("chess")
-        }));
-
+        let edited = persona(json!({"name": "Mira", "personality": "fiery"}));
+        let changes = meta.tracked.record(&edited, Author::User, now);
         let text = describe_changes(&changes, "Borys");
+        assert!(text.starts_with("Borys edited the file that defines who you are."));
         assert!(text.contains("from \"calm\" (chosen by you) to \"fiery\""));
-
-        accept_user_changes(&mut meta, &edited, &changes, now);
-        assert!(detect_changes(&edited, &meta).is_empty());
         assert_eq!(meta.author_of("personality"), Author::User);
-        assert_eq!(meta.author_of("name"), Author::Companion);
-        assert!(!meta.fields.contains_key("quirks"));
+        // The on-disk format is unchanged by the refactoring.
+        let json = serde_json::to_value(&meta).unwrap();
+        assert!(json["fields"]["name"].is_object() && json["snapshot"].is_object());
     }
 
     #[test]

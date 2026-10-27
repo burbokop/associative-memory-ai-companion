@@ -8,9 +8,11 @@ mod mind;
 mod persona;
 mod profile;
 mod prompt;
+mod relationship;
 mod session;
 mod storage;
 mod timefmt;
+mod tracking;
 
 use std::path::PathBuf;
 
