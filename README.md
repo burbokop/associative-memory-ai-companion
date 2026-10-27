@@ -15,7 +15,12 @@ cargo run --release -- --help
 
 On first start of a profile the companion chooses its own persona (or you write it yourself).
 Inside the chat type `/help` for commands (`/emotions`, `/persona`, `/memories [query]`,
-`/facts`, `/relationship`, `/compact`, `/debug`, `/exit`).
+`/facts`, `/relationship`, `/compact`, `/model`, `/effort`, `/debug`, `/exit`); they are also
+listed in `--help`.
+
+Each companion can run on its own model: switch it in the chat with `/model <name>` (saved for
+that companion; add `--temp` to try it for one run). `--model <name>` on the command line is
+for one run only. The default for new companions is `model` in `config.json`.
 
 ## Data
 
@@ -30,6 +35,7 @@ profiles/<name>/
   persona_meta.json           who wrote each persona field + last seen snapshot
   relationship.json           how the companion sees your relationship — editable too
   relationship_meta.json      who wrote each field, snapshot, history of labels
+  settings.json               this companion's model / reasoning effort (overrides config.json)
   state.json                  user name, current emotions, last interaction time,
                               the model it ran on last (to notice upgrades/downgrades)
   short_term.json             recent raw messages (with emotions and inner thoughts)

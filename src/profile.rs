@@ -45,6 +45,9 @@ impl Paths {
     pub fn relationship_meta(&self) -> PathBuf {
         self.dir.join("relationship_meta.json")
     }
+    pub fn settings(&self) -> PathBuf {
+        self.dir.join("settings.json")
+    }
     pub fn state(&self) -> PathBuf {
         self.dir.join("state.json")
     }
@@ -57,6 +60,16 @@ impl Paths {
     pub fn embeddings(&self) -> PathBuf {
         self.dir.join("embeddings.json")
     }
+}
+
+/// Per-profile overrides of the global config (`settings.json`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Everything about the relationship that is not memory or persona.
@@ -85,6 +98,7 @@ pub struct Profile {
     pub persona_meta: PersonaMeta,
     pub relationship: Relationship,
     pub relationship_meta: RelationshipMeta,
+    pub settings: ProfileSettings,
     pub state: State,
     pub short_term: Vec<Message>,
     pub long_term: LongTerm,
@@ -113,6 +127,7 @@ impl Profile {
             persona_meta,
             relationship,
             relationship_meta,
+            settings: ProfileSettings::default(),
             state,
             short_term: Vec::new(),
             long_term: LongTerm::default(),
@@ -166,6 +181,7 @@ impl Profile {
             long_term.embeddings = store.vectors;
         }
 
+        let paths_settings = paths.settings();
         let profile = Self {
             name: name.to_string(),
             paths,
@@ -173,6 +189,7 @@ impl Profile {
             persona_meta,
             relationship,
             relationship_meta,
+            settings: storage::load(&paths_settings)?.unwrap_or_default(),
             state,
             short_term,
             long_term,
@@ -193,6 +210,10 @@ impl Profile {
 
     pub fn save_relationship_meta(&self) -> Result<()> {
         storage::save(&self.paths.relationship_meta(), &self.relationship_meta)
+    }
+
+    pub fn save_settings(&self) -> Result<()> {
+        storage::save(&self.paths.settings(), &self.settings)
     }
 
     pub fn save_persona_meta(&self) -> Result<()> {

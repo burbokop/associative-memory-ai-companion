@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::config::Config;
+use crate::{config::Config, mind::Mind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,6 +46,9 @@ pub struct JsonRequest {
 pub trait Llm {
     async fn complete_json(&self, request: JsonRequest) -> Result<Value>;
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// Switches the model (and reasoning effort) used for completions.
+    fn set_mind(&mut self, mind: &Mind);
 
     /// Like [`Llm::complete_json`], deserialised into `T`.
     async fn complete<T: DeserializeOwned>(&self, request: JsonRequest) -> Result<T> {
@@ -101,6 +104,11 @@ impl OpenAi {
 }
 
 impl Llm for OpenAi {
+    fn set_mind(&mut self, mind: &Mind) {
+        self.config.model = mind.model.clone();
+        self.config.reasoning_effort = mind.reasoning_effort.clone();
+    }
+
     async fn complete_json(&self, request: JsonRequest) -> Result<Value> {
         let mut body = json!({
             "model": self.config.model,
@@ -224,6 +232,7 @@ pub mod fake {
     pub struct FakeLlm {
         pub answers: RefCell<VecDeque<Value>>,
         pub requests: RefCell<Vec<JsonRequest>>,
+        pub mind: Option<Mind>,
     }
 
     impl FakeLlm {
@@ -251,6 +260,10 @@ pub mod fake {
     }
 
     impl Llm for FakeLlm {
+        fn set_mind(&mut self, mind: &Mind) {
+            self.mind = Some(mind.clone());
+        }
+
         async fn complete_json(&self, request: JsonRequest) -> Result<Value> {
             self.requests.borrow_mut().push(request);
             self.answers
