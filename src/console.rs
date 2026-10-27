@@ -11,6 +11,7 @@ use crate::{
     config::Config,
     emotion::Emotions,
     llm::Llm,
+    memory::{Message, Speaker},
     persona::{self, Author, PersonaMeta},
     profile::{Paths, Profile, State},
     session::{Reply, Session},
@@ -131,15 +132,51 @@ fn typing(name: &str) {
     let _ = std::io::stdout().flush();
 }
 
+fn print_thoughts(thoughts: &str) {
+    println!("{}", format!("  💭 {thoughts}").dimmed().italic());
+}
+
 fn print_reply(name: &str, reply: &Reply, debug: bool) {
     if debug {
         for memory in &reply.recalled {
             println!("{}", format!("  🔎 recalled: {memory}").dimmed());
         }
-        println!("{}", format!("  💭 {}", reply.thoughts).dimmed().italic());
+        print_thoughts(&reply.thoughts);
     }
     println!("{}  {}", name.bold().magenta(), reply.emotions.render());
     println!("{}\n", reply.content);
+}
+
+/// Shows the end of the previous conversation when resuming.
+fn print_history(messages: &[&Message], name: &str, user: &str, debug: bool) {
+    if messages.is_empty() {
+        return;
+    }
+    println!("{}", "── earlier ──".dimmed());
+    for m in messages {
+        let stamp = format!("[{}]", timefmt::stamp(m.time)).dimmed();
+        match m.speaker {
+            Speaker::User => println!(
+                "{stamp} {} {}\n",
+                format!("{user}>").bold().cyan(),
+                m.content
+            ),
+            Speaker::Companion => {
+                if debug && let Some(thoughts) = &m.thoughts {
+                    print_thoughts(thoughts);
+                }
+                let emotions = m
+                    .emotions
+                    .as_ref()
+                    .map(Emotions::render)
+                    .unwrap_or_default();
+                println!("{stamp} {}  {emotions}", name.bold().magenta());
+                println!("{}\n", m.content);
+            }
+            Speaker::Event => {}
+        }
+    }
+    println!("{}", "── now ──".dimmed());
 }
 
 fn print_error(e: &anyhow::Error) {
@@ -161,6 +198,13 @@ pub async fn chat<L: Llm>(
             session.profile.name, session.config.model
         )
         .dimmed()
+    );
+
+    print_history(
+        &session.recent_messages(session.config.resume_history_messages),
+        &name,
+        &user,
+        debug,
     );
 
     typing(&name);

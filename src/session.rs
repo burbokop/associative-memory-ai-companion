@@ -298,6 +298,21 @@ impl<L: Llm> Session<L> {
         Ok(report)
     }
 
+    /// The last `count` chat messages (without internal events), oldest first.
+    /// Only messages still in short-term memory are available.
+    pub fn recent_messages(&self, count: usize) -> Vec<&Message> {
+        let mut list: Vec<&Message> = self
+            .profile
+            .short_term
+            .iter()
+            .rev()
+            .filter(|m| m.speaker != Speaker::Event)
+            .take(count)
+            .collect();
+        list.reverse();
+        list
+    }
+
     /// Memories most related to `query`, with their scores.
     pub async fn search_memories(&self, query: &str) -> Result<Vec<(f32, &Memory)>> {
         let vector = self.llm.embed_one(query).await?;
@@ -408,6 +423,30 @@ mod tests {
         let events = s.profile.short_term.len();
         assert!(s.start().await.unwrap().is_none());
         assert_eq!(s.profile.short_term.len(), events);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn recent_messages_skip_events() {
+        let (mut s, data) = session("recent", vec![]);
+        let now = Utc::now();
+        for (speaker, text) in [
+            (Speaker::User, "one"),
+            (Speaker::Companion, "two"),
+            (Speaker::Event, "event"),
+            (Speaker::User, "three"),
+        ] {
+            s.profile.short_term.push(Message::new(speaker, text, now));
+        }
+        let texts = |n| -> Vec<String> {
+            s.recent_messages(n)
+                .iter()
+                .map(|m| m.content.clone())
+                .collect()
+        };
+        assert_eq!(texts(2), ["two", "three"]);
+        assert_eq!(texts(10), ["one", "two", "three"]);
+        assert!(texts(0).is_empty());
         std::fs::remove_dir_all(data).unwrap();
     }
 
