@@ -19,7 +19,7 @@ use crate::{
     storage, timefmt,
 };
 
-const HELP: &str = "\
+pub const HELP: &str = "\
 /emotions          how your companion feels right now
 /persona           show the persona and who wrote each field
 /relationship      how your companion sees your relationship (they will know you looked;
@@ -27,6 +27,9 @@ const HELP: &str = "\
 /memories [query]  list long-term memories (strongest first), or search them
 /facts             core facts that are never forgotten
 /compact           consolidate the conversation into long-term memory now
+/model             show the model your companion runs on and the models it knows
+/model <name>      switch model; saved for this companion (add --temp for this run only)
+/effort <level>    switch reasoning effort, e.g. low, medium, high (also takes --temp)
 /debug             toggle showing inner thoughts, recalled memories, relationship changes
 /help              this help
 /exit              leave (also Ctrl-D); everything is saved after each message";
@@ -170,6 +173,32 @@ fn print_new_label(name: &str, label: &Option<String>) {
     }
 }
 
+/// `/model` without arguments: current settings and the known models.
+fn print_mind<L: Llm>(session: &Session<L>) {
+    let source = if session.temporary_mind {
+        "this run only"
+    } else if session.profile.settings.model.is_some() {
+        "chosen for this companion"
+    } else {
+        "default from config.json"
+    };
+    println!(
+        "{} {} ({source}), reasoning effort {}",
+        "Model:".bold(),
+        session.mind.model,
+        session.mind.effort()
+    );
+    println!("{}", "Known models (config.json → models):".bold());
+    for (model, description) in &session.config.models {
+        let marker = if *model == session.mind.model {
+            "▶"
+        } else {
+            " "
+        };
+        println!("{marker} {model:<14} {}", description.dimmed());
+    }
+}
+
 /// Shows the end of the previous conversation when resuming.
 fn print_history(messages: &[&Message], name: &str, user: &str, debug: bool) {
     if messages.is_empty() {
@@ -217,8 +246,14 @@ pub async fn chat<L: Llm>(
     println!(
         "{}",
         format!(
-            "Chatting with {name} (profile '{}', model {}). Type /help for commands.",
-            session.profile.name, session.config.model
+            "Chatting with {name} (profile '{}', model {}{}). Type /help for commands.",
+            session.profile.name,
+            session.mind.model,
+            if session.temporary_mind {
+                ", this run only"
+            } else {
+                ""
+            }
         )
         .dimmed()
     );
@@ -260,6 +295,56 @@ pub async fn chat<L: Llm>(
             let (command, argument) = command.split_once(' ').unwrap_or((command, ""));
             match command {
                 "exit" | "quit" => break,
+                "model" | "effort" => {
+                    let mut words: Vec<&str> = argument.split_whitespace().collect();
+                    let temporary = words.contains(&"--temp");
+                    words.retain(|w| *w != "--temp");
+                    let Some(value) = words.first().map(|w| w.to_string()) else {
+                        print_mind(&session);
+                        continue;
+                    };
+                    let mut new = session.mind.clone();
+                    if command == "model" {
+                        if !session.config.models.contains_key(&value) {
+                            println!(
+                                "{}",
+                                format!(
+                                    "note: {value} is not in the model catalog in config.json; \
+                                     {name} will know nothing about it"
+                                )
+                                .yellow()
+                            );
+                        }
+                        new.model = value;
+                    } else {
+                        new.reasoning_effort = Some(value);
+                    }
+                    typing(&name);
+                    let result = session.switch_mind(new, !temporary).await;
+                    clear_line();
+                    match result {
+                        Ok(reply) => {
+                            println!(
+                                "{}",
+                                format!(
+                                    "{name} now runs on {} (reasoning effort {}) — {}",
+                                    session.mind.model,
+                                    session.mind.effort(),
+                                    if temporary {
+                                        "for this run only".to_string()
+                                    } else {
+                                        format!("saved for {name}")
+                                    }
+                                )
+                                .dimmed()
+                            );
+                            if let Some(reply) = reply {
+                                print_reply(&name, &reply, debug);
+                            }
+                        }
+                        Err(e) => print_error(&e),
+                    }
+                }
                 "help" => println!("{HELP}"),
                 "debug" => {
                     debug = !debug;

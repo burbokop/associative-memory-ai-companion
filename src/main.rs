@@ -29,7 +29,7 @@ use crate::{
 
 /// An AI companion with emotions and a memory that fades like a person's.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, after_help = format!("In-chat commands:\n{}", console::HELP))]
 struct Cli {
     /// Where profiles and settings are stored [default: ~/.associative_memory_ai_companion]
     #[arg(long, env = "COMPANION_DATA_DIR", global = true)]
@@ -39,7 +39,7 @@ struct Cli {
     #[arg(short, long, default_value = "default", global = true)]
     profile: String,
 
-    /// Override the chat model from config.json
+    /// Use another model for this run only (switch for good with /model in the chat)
     #[arg(long, global = true)]
     model: Option<String>,
 
@@ -71,10 +71,7 @@ async fn main() -> Result<()> {
         Some(dir) => dir,
         None => default_data_dir()?,
     };
-    let mut config = Config::load_or_create(&data_dir.join("config.json"))?;
-    if let Some(model) = cli.model {
-        config.model = model;
-    }
+    let config = Config::load_or_create(&data_dir.join("config.json"))?;
 
     if let Some(Command::Profiles) = cli.command {
         return console::list_profiles(&data_dir, &config.embedding_model);
@@ -99,6 +96,9 @@ async fn main() -> Result<()> {
         }
     };
 
-    let session = Session::new(llm, config, profile);
+    let mut session = Session::new(llm, config, profile);
+    if let Some(model) = cli.model {
+        session.use_model_temporarily(model);
+    }
     console::chat(session, editor, cli.debug, &history).await
 }

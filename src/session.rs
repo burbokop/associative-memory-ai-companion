@@ -43,15 +43,91 @@ pub struct Session<L: Llm> {
     pub llm: L,
     pub config: Config,
     pub profile: Profile,
+    /// The model and reasoning effort the companion runs on right now.
+    pub mind: Mind,
+    /// Whether `mind` is only for this run (not saved in the profile).
+    pub temporary_mind: bool,
 }
 
 impl<L: Llm> Session<L> {
-    pub fn new(llm: L, config: Config, profile: Profile) -> Self {
+    pub fn new(mut llm: L, config: Config, profile: Profile) -> Self {
+        let mind = Mind::effective(&config, &profile.settings);
+        llm.set_mind(&mind);
         Self {
             llm,
             config,
             profile,
+            mind,
+            temporary_mind: false,
         }
+    }
+
+    /// Uses another model for this run only (`--model`).
+    pub fn use_model_temporarily(&mut self, model: String) {
+        self.mind.model = model;
+        self.temporary_mind = true;
+        self.llm.set_mind(&self.mind);
+    }
+
+    /// Switches model or reasoning effort during the chat. The companion is told and
+    /// reacts right away; if the new model does not work, everything is rolled back.
+    /// With `save`, the choice is stored in the profile's settings.
+    pub async fn switch_mind(&mut self, new: Mind, save: bool) -> Result<Option<Reply>> {
+        if new == self.mind {
+            if save && self.temporary_mind {
+                self.save_mind_settings()?;
+                self.temporary_mind = false;
+            }
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let previous_mind = self.mind.clone();
+        let previous_temporary = self.temporary_mind;
+        let previous_record = self.profile.state.mind.clone();
+        let record = previous_record.clone().unwrap_or_else(|| MindRecord {
+            mind: previous_mind.clone(),
+            since: now,
+        });
+
+        let text = mind::describe_change(&record, &new, &self.config, self.user_name(), now, !save);
+        if let Some(text) = &text {
+            self.profile
+                .short_term
+                .push(Message::new(Speaker::Event, text.clone(), now));
+        }
+        self.profile.state.mind = Some(MindRecord {
+            mind: new.clone(),
+            since: now,
+        });
+        self.mind = new;
+        self.temporary_mind = !save;
+        self.llm.set_mind(&self.mind);
+
+        match self.respond().await {
+            Ok(reply) => {
+                if save {
+                    self.save_mind_settings()?;
+                }
+                Ok(Some(reply))
+            }
+            Err(e) => {
+                if text.is_some() {
+                    self.profile.short_term.pop();
+                }
+                self.profile.state.mind = previous_record;
+                self.mind = previous_mind;
+                self.temporary_mind = previous_temporary;
+                self.llm.set_mind(&self.mind);
+                self.profile.save()?;
+                Err(e.context("the new settings did not work, switched back"))
+            }
+        }
+    }
+
+    fn save_mind_settings(&mut self) -> Result<()> {
+        self.profile.settings.model = Some(self.mind.model.clone());
+        self.profile.settings.reasoning_effort = self.mind.reasoning_effort.clone();
+        self.profile.save_settings()
     }
 
     pub fn companion_name(&self) -> String {
@@ -116,12 +192,19 @@ impl<L: Llm> Session<L> {
         let user = self.user_name().to_string();
         let mut speak_first = self.sync_files()?;
 
-        let current_mind = Mind::from_config(&self.config);
+        let current_mind = self.mind.clone();
         match &self.profile.state.mind {
             Some(record) if record.mind == current_mind => {}
             previous => {
                 if let Some(text) = previous.as_ref().and_then(|old| {
-                    mind::describe_change(old, &current_mind, &self.config, &user, now)
+                    mind::describe_change(
+                        old,
+                        &current_mind,
+                        &self.config,
+                        &user,
+                        now,
+                        self.temporary_mind,
+                    )
                 }) {
                     self.profile
                         .short_term
@@ -240,7 +323,7 @@ impl<L: Llm> Session<L> {
             emotions: &profile.state.emotions,
             mind: mind::render_for_prompt(
                 &profile.state.mind.clone().unwrap_or_else(|| MindRecord {
-                    mind: Mind::from_config(config),
+                    mind: self.mind.clone(),
                     since: now,
                 }),
                 config,
@@ -531,6 +614,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switching_model_in_chat_is_saved_per_profile() {
+        let (mut s, data) = session("switch", vec![turn("I feel so much smarter!")]);
+        s.profile.state.last_interaction = Some(Utc::now());
+        let mut new = s.mind.clone();
+        new.model = "gpt-6-astra".into();
+
+        let reply = s.switch_mind(new.clone(), true).await.unwrap().unwrap();
+        assert_eq!(reply.content, "I feel so much smarter!");
+        assert!(last_event(&s).contains("to gpt-6-astra"));
+        assert!(!last_event(&s).contains("only for this conversation"));
+        assert_eq!(s.llm.mind.as_ref().unwrap().model, "gpt-6-astra");
+        assert_eq!(s.profile.state.mind.as_ref().unwrap().mind, new);
+
+        // Saved for this profile only; the global default stays as it was.
+        let reloaded = Profile::load("t", Paths::new(&data, "t"), "fake").unwrap();
+        assert_eq!(reloaded.settings.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(s.config.model, "gpt-6-luna");
+        let next = Session::new(FakeLlm::default(), s.config.clone(), reloaded);
+        assert_eq!(next.mind.model, "gpt-6-astra");
+        assert!(!next.temporary_mind);
+
+        // Switching to the same settings again does nothing.
+        assert!(s.switch_mind(new, true).await.unwrap().is_none());
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_model_switch_is_rolled_back() {
+        let (mut s, data) = session("switch-fail", vec![]);
+        s.profile.state.last_interaction = Some(Utc::now());
+        let before = s.mind.clone();
+        let messages = s.profile.short_term.len();
+        let mut new = before.clone();
+        new.model = "no-such-model".into();
+
+        assert!(s.switch_mind(new, true).await.is_err());
+        assert_eq!(s.mind, before);
+        assert_eq!(s.llm.mind.as_ref().unwrap(), &before);
+        assert_eq!(s.profile.short_term.len(), messages);
+        assert!(!s.profile.paths.settings().exists());
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
     async fn reacts_to_model_changes() {
         let (mut s, data) = session("mind", vec![turn("Hey, what happened to my brain?")]);
         s.profile.state.last_interaction = Some(Utc::now() - TimeDelta::minutes(1));
@@ -542,9 +669,12 @@ mod tests {
             "gpt-6-luna"
         );
 
-        s.config.model = "gpt-6-astra".into();
+        s.use_model_temporarily("gpt-6-astra".into());
         assert!(s.start().await.unwrap().is_some());
         assert!(last_event(&s).contains("from gpt-6-luna (the cheapest"));
+        assert!(last_event(&s).contains("only for this conversation"));
+        assert_eq!(s.llm.mind.as_ref().unwrap().model, "gpt-6-astra");
+        assert!(!s.profile.paths.settings().exists(), "--model is not saved");
         assert_eq!(
             s.profile.state.mind.as_ref().unwrap().mind.model,
             "gpt-6-astra"
