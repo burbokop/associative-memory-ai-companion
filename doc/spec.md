@@ -40,7 +40,9 @@ AI agent (companion) with emotions that should behave as a real person, that you
 - **Time tracking:** every message is timestamped and the model sees the current time and the gap since the last message. After a long absence the companion speaks first when the user comes back. Reacting to silence while the app is open is deferred to Phase 3.
 
 ### Phase 2
-- It should have an ability to run bash commands withing confined docker image without access to internet or host file system.
+- It should have an ability to run bash commands withing confined docker image without access to internet or host file system. How sould this work: user can run app with `--container [dir]` parameter. In that case application runs docker command (Dockerfile is embedded into the app's binary). The binary is passed to container and run inside with parameter `--bash-access [some connection id]` (probably some safeguard should be added so that it will be impossible to run with this flag on non-docker host). All logic is performed in outer instance of the app. when agent wants to run bash command the app sends message to the instance inside docker, it runs the command and sends exit code, termination signal, stdout, stderr back. From inside of the container there should not be a way to access outer world (no internet connection). It can only access its internal filesystem that is itself stored in `dir` passed to `--container` parameter. It sohuld not be able to access filesystem outside of this folder. the whole system should be completely isolated by linux means, so that there it couldnt be broken by any programe that agent could write inside. 
+- The container should be debian 14, have gcc, g++, clang, clang++, rust, python installed additionally some rust packages (like serde, serde_json, rand, tokio) preinstalled since it will be impossible to install them after container is started.
+
 ### Phase 3
 - It should be able to run as background task make OpenAI requests periodically with some interval to emulate personal time outside of the chat.
 ### Phase 4
