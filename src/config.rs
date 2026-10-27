@@ -46,6 +46,8 @@ pub struct Config {
     pub emotion_half_life_hours: f64,
     /// After this much silence the companion speaks first when the user comes back.
     pub absence_greeting_after_minutes: i64,
+    /// How many of the last messages are shown when resuming a conversation (0 = none).
+    pub resume_history_messages: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +90,7 @@ impl Default for Config {
             recent_memories_in_prompt: 3,
             emotion_half_life_hours: 12.0,
             absence_greeting_after_minutes: 60,
+            resume_history_messages: 10,
         }
     }
 }
